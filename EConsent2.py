@@ -1,7 +1,10 @@
 # streamlit_app.py
 # Thai E-Consent App
-# Streamlit + PostgreSQL + Signatures + PDF + Admin Dashboard
-# FIXED: no cached psycopg2 connection; fresh short-lived DB connections
+# Streamlit + PostgreSQL + Signature Image Uploads + PDF + Admin Dashboard
+# FIXED FOR STREAMLIT CLOUD:
+# - no cached psycopg2 connection; fresh short-lived DB connections
+# - removed streamlit-drawable-canvas because its frontend can fail on Streamlit Cloud
+# - signature is uploaded as PNG/JPG instead of drawn inside browser component
 #
 # requirements.txt:
 # streamlit
@@ -10,7 +13,6 @@
 # reportlab
 # pytz
 # pillow
-# streamlit-drawable-canvas
 #
 # Streamlit Cloud secrets.toml example:
 # Recommended Supabase pooler format for Streamlit Cloud:
@@ -31,8 +33,6 @@ import psycopg2.extras
 import pytz
 import streamlit as st
 from PIL import Image
-from streamlit_drawable_canvas import st_canvas
-
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
@@ -166,25 +166,48 @@ def now_bkk():
     return datetime.now(BKK).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def sig_pad(label, key):
+def signature_upload(label, key, required=False):
+    """
+    More stable than streamlit-drawable-canvas on Streamlit Cloud.
+    User signs on paper or phone, takes a photo/screenshot, then uploads PNG/JPG.
+    The image is stored as base64 text in PostgreSQL.
+    """
     st.markdown(f"### {label}")
-    canvas = st_canvas(
-        stroke_width=2,
-        stroke_color="#000000",
-        background_color="#FFFFFF",
-        height=180,
-        width=500,
-        drawing_mode="freedraw",
+    uploaded = st.file_uploader(
+        "อัปโหลดภาพลายเซ็น PNG/JPG",
+        type=["png", "jpg", "jpeg"],
         key=key,
+        help="ให้เซ็นบนกระดาษหรือหน้าจอมือถือ แล้วถ่ายภาพ/บันทึกภาพเพื่ออัปโหลด",
     )
 
-    if canvas.image_data is not None:
-        img = Image.fromarray(canvas.image_data.astype("uint8"))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
-    return None
+    if uploaded is None:
+        if required:
+            st.caption("จำเป็นต้องมีลายเซ็นนี้ก่อนบันทึก")
+        return None
 
+    try:
+        img = Image.open(uploaded).convert("RGBA")
+
+        # Resize to keep database size reasonable while preserving visual clarity.
+        max_width = 900
+        if img.width > max_width:
+            ratio = max_width / img.width
+            img = img.resize((max_width, int(img.height * ratio)))
+
+        # Put on white background, because JPG/photo transparency can vary.
+        white_bg = Image.new("RGBA", img.size, "WHITE")
+        white_bg.alpha_composite(img)
+        img = white_bg.convert("RGB")
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        sig64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        st.image(img, caption=label, width=300)
+        return sig64
+    except Exception as e:
+        st.error(f"ไม่สามารถอ่านไฟล์ลายเซ็นได้: {e}")
+        return None
 
 def decode_sig_to_tempfile(sig64):
     data = base64.b64decode(sig64)
@@ -317,9 +340,10 @@ if menu == "Patient Consent Form":
     agree = st.checkbox("ข้าพเจ้ายินยอม")
 
     st.markdown("---")
-    patient_sig = sig_pad("ผู้ป่วยเซ็นชื่อ", "patient_signature_canvas")
-    doctor_sig = sig_pad("แพทย์เซ็นชื่อ", "doctor_signature_canvas")
-    nurse_sig = sig_pad("พยาบาลพยานเซ็นชื่อ", "nurse_signature_canvas")
+    st.info("วิธีใช้: ให้ผู้ป่วย/แพทย์/พยาบาลเซ็นบนกระดาษหรือมือถือ แล้วถ่ายภาพ/บันทึกภาพเป็น PNG/JPG เพื่ออัปโหลด ระบบนี้เสถียรกว่า canvas บน Streamlit Cloud")
+    patient_sig = signature_upload("ผู้ป่วยเซ็นชื่อ", "patient_signature_upload", required=True)
+    doctor_sig = signature_upload("แพทย์เซ็นชื่อ", "doctor_signature_upload")
+    nurse_sig = signature_upload("พยาบาลพยานเซ็นชื่อ", "nurse_signature_upload")
 
     if st.button("💾 Save", type="primary"):
         if not patient_id.strip() or not patient_name.strip():
