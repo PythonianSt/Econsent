@@ -59,7 +59,8 @@ def get_database_url() -> str:
 @st.cache_resource
 def get_conn():
     return psycopg2.connect(
-        st.secrets["DATABASE_URL"]
+        st.secrets["DATABASE_URL"],
+        connect_timeout=10
     )
 
 conn = get_conn()
