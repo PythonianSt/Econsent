@@ -1,6 +1,7 @@
 # streamlit_app.py
 # Thai E-Consent App
 # Streamlit + PostgreSQL + Signatures + PDF + Admin Dashboard
+# FIXED: no cached psycopg2 connection; fresh short-lived DB connections
 #
 # requirements.txt:
 # streamlit
@@ -12,7 +13,8 @@
 # streamlit-drawable-canvas
 #
 # Streamlit Cloud secrets.toml example:
-# DATABASE_URL = "postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require"
+# Recommended Supabase pooler format for Streamlit Cloud:
+# DATABASE_URL = "postgresql://postgres.PROJECT_ID:PASSWORD@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres?sslmode=require"
 # Optional, if you upload a Thai font file into your repo:
 # THAI_FONT_PATH = "fonts/NotoSansThai-Regular.ttf"
 
@@ -56,14 +58,10 @@ def get_database_url() -> str:
         st.stop()
     return db_url
 
-@st.cache_resource
-def get_conn():
-    return psycopg2.connect(
-        st.secrets["DATABASE_URL"],
-        connect_timeout=10
-    )
 
-conn = get_conn()
+def get_conn():
+    """Create a PostgreSQL connection. The connection is short-lived and closed after use."""
+    return psycopg2.connect(get_database_url(), connect_timeout=10)
 
 
 def init_db():
@@ -392,3 +390,4 @@ if menu == "Admin Dashboard":
         st.bar_chart(df["procedure"].value_counts())
     else:
         st.info("No data")
+
