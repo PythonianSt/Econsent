@@ -1,10 +1,11 @@
 # streamlit_app.py
 # Thai E-Consent App
-# Streamlit + PostgreSQL + Signature Image Uploads + PDF + Admin Dashboard
-# FIXED FOR STREAMLIT CLOUD:
+# Streamlit + PostgreSQL + Mobile Camera Signature Capture + PDF + Admin Dashboard
+# FIXES/FEATURES:
 # - no cached psycopg2 connection; fresh short-lived DB connections
-# - removed streamlit-drawable-canvas because its frontend can fail on Streamlit Cloud
-# - signature is uploaded as PNG/JPG instead of drawn inside browser component
+# - no streamlit-drawable-canvas dependency
+# - uses st.camera_input for patient/doctor/nurse paper-signature capture on mobile
+# - expanded block menu: ankle, brachial, popliteal, cervical, sciatic, other
 #
 # requirements.txt:
 # streamlit
@@ -15,7 +16,6 @@
 # pillow
 #
 # Streamlit Cloud secrets.toml example:
-# Recommended Supabase pooler format for Streamlit Cloud:
 # DATABASE_URL = "postgresql://postgres.PROJECT_ID:PASSWORD@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres?sslmode=require"
 # Optional, if you upload a Thai font file into your repo:
 # THAI_FONT_PATH = "fonts/NotoSansThai-Regular.ttf"
@@ -29,10 +29,9 @@ from pathlib import Path
 
 import pandas as pd
 import psycopg2
-import psycopg2.extras
 import pytz
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
@@ -43,7 +42,6 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RL
 # ---------------- CONFIG ----------------
 st.set_page_config(page_title="Thai E-Consent", layout="wide")
 BKK = pytz.timezone("Asia/Bangkok")
-
 TABLE_NAME = "consent_records"
 
 # ---------------- DATABASE ----------------
@@ -60,7 +58,7 @@ def get_database_url() -> str:
 
 
 def get_conn():
-    """Create a PostgreSQL connection. The connection is short-lived and closed after use."""
+    """Create a short-lived PostgreSQL connection. Do not cache psycopg2 connections in Streamlit."""
     return psycopg2.connect(get_database_url(), connect_timeout=10)
 
 
@@ -127,7 +125,6 @@ def fetch_records() -> pd.DataFrame:
         return pd.read_sql(sql, conn)
 
 
-# Initialize DB once at app start.
 try:
     init_db()
 except Exception as e:
@@ -138,7 +135,6 @@ except Exception as e:
 def setup_pdf_font() -> str:
     """Register a Thai-capable font if available; otherwise fallback to Helvetica."""
     candidates = []
-
     secret_font = st.secrets.get("THAI_FONT_PATH", None)
     if secret_font:
         candidates.append(secret_font)
@@ -156,8 +152,8 @@ def setup_pdf_font() -> str:
         if path and Path(path).exists():
             pdfmetrics.registerFont(TTFont("ThaiFont", path))
             return "ThaiFont"
-
     return "Helvetica"
+
 
 PDF_FONT = setup_pdf_font()
 
@@ -166,50 +162,46 @@ def now_bkk():
     return datetime.now(BKK).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def signature_upload(label, key, required=False):
+def image_to_base64_png(img: Image.Image, max_width: int = 900) -> str:
+    """Normalize, resize and encode image as base64 PNG for PostgreSQL TEXT storage."""
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("RGB")
+
+    if img.width > max_width:
+        ratio = max_width / img.width
+        img = img.resize((max_width, max(1, int(img.height * ratio))))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def camera_signature(label: str, key: str, required: bool = False):
     """
-    More stable than streamlit-drawable-canvas on Streamlit Cloud.
-    User signs on paper or phone, takes a photo/screenshot, then uploads PNG/JPG.
-    The image is stored as base64 text in PostgreSQL.
+    Capture a signature from paper using mobile camera.
+    Streamlit camera_input opens the device camera on mobile browser and returns one captured frame.
     """
     st.markdown(f"### {label}")
-    uploaded = st.file_uploader(
-        "อัปโหลดภาพลายเซ็น PNG/JPG",
-        type=["png", "jpg", "jpeg"],
-        key=key,
-        help="ให้เซ็นบนกระดาษหรือหน้าจอมือถือ แล้วถ่ายภาพ/บันทึกภาพเพื่ออัปโหลด",
-    )
+    st.caption("ให้เซ็นบนกระดาษ แล้วใช้กล้องมือถือถ่ายเฉพาะบริเวณลายเซ็นให้ชัดเจน")
 
-    if uploaded is None:
+    photo = st.camera_input("ถ่ายภาพลายเซ็นจากกระดาษ", key=key)
+    if photo is None:
         if required:
             st.caption("จำเป็นต้องมีลายเซ็นนี้ก่อนบันทึก")
         return None
 
     try:
-        img = Image.open(uploaded).convert("RGBA")
-
-        # Resize to keep database size reasonable while preserving visual clarity.
-        max_width = 900
-        if img.width > max_width:
-            ratio = max_width / img.width
-            img = img.resize((max_width, int(img.height * ratio)))
-
-        # Put on white background, because JPG/photo transparency can vary.
-        white_bg = Image.new("RGBA", img.size, "WHITE")
-        white_bg.alpha_composite(img)
-        img = white_bg.convert("RGB")
-
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
-        sig64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-        st.image(img, caption=label, width=300)
+        img = Image.open(photo)
+        sig64 = image_to_base64_png(img)
+        preview_img = Image.open(io.BytesIO(base64.b64decode(sig64)))
+        st.image(preview_img, caption=label, width=320)
         return sig64
     except Exception as e:
-        st.error(f"ไม่สามารถอ่านไฟล์ลายเซ็นได้: {e}")
+        st.error(f"ไม่สามารถอ่านภาพลายเซ็นได้: {e}")
         return None
 
-def decode_sig_to_tempfile(sig64):
+
+def decode_sig_to_tempfile(sig64: str):
     data = base64.b64decode(sig64)
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     tmp.write(data)
@@ -217,7 +209,80 @@ def decode_sig_to_tempfile(sig64):
     return tmp.name
 
 
-def create_pdf(record):
+def procedure_information(procedure: str) -> str:
+    """Thai plain-language consent information by procedure."""
+    info = {
+        "Ankle Block": """
+การฉีดยาชาบริเวณข้อเท้าเพื่อทำแผลหรือหัตถการบริเวณเท้า
+
+ความเสี่ยงที่อาจเกิดขึ้น:
+- เจ็บบริเวณที่ฉีด
+- ชาชั่วคราวหรืออ่อนแรงชั่วคราว
+- เลือดออกหรือช้ำ
+- ติดเชื้อ
+- แพ้ยา
+- เส้นประสาทระคายเคืองหรือบาดเจ็บ พบน้อย
+""",
+        "Brachial Block": """
+การฉีดยาชาบริเวณเส้นประสาทแขนเพื่อทำแผลหรือหัตถการบริเวณแขน/มือ
+
+ความเสี่ยงที่อาจเกิดขึ้น:
+- เจ็บบริเวณที่ฉีด
+- ชาหรืออ่อนแรงชั่วคราว
+- เลือดออกหรือช้ำ
+- แพ้ยา
+- เส้นประสาทบาดเจ็บ พบน้อย
+""",
+        "Popliteal Block": """
+การฉีดยาชาบริเวณหลังเข่าเพื่อระงับความรู้สึกบริเวณขาส่วนล่าง/เท้า
+
+ความเสี่ยงที่อาจเกิดขึ้น:
+- เจ็บบริเวณที่ฉีด
+- ชาหรืออ่อนแรงชั่วคราวของขาหรือเท้า
+- เลือดออกหรือช้ำ
+- ติดเชื้อ
+- แพ้ยา
+- เส้นประสาทระคายเคืองหรือบาดเจ็บ พบน้อย
+""",
+        "Cervical Block": """
+การฉีดยาชาบริเวณคอ/เส้นประสาทบริเวณคอ ตามข้อบ่งชี้ทางการแพทย์
+
+ความเสี่ยงที่อาจเกิดขึ้น:
+- เจ็บบริเวณที่ฉีด
+- เลือดออกหรือช้ำ
+- ติดเชื้อ
+- แพ้ยา
+- ชาหรืออ่อนแรงชั่วคราว
+- เส้นประสาทระคายเคืองหรือบาดเจ็บ พบน้อย
+- อาการผิดปกติบริเวณคอหรือการหายใจ ควรแจ้งแพทย์ทันทีหากเกิดขึ้น
+""",
+        "Sciatic Block": """
+การฉีดยาชาบริเวณเส้นประสาทไซอาติกเพื่อระงับความรู้สึกบริเวณขา/เท้า
+
+ความเสี่ยงที่อาจเกิดขึ้น:
+- เจ็บบริเวณที่ฉีด
+- ชาหรืออ่อนแรงชั่วคราวของขาหรือเท้า
+- เลือดออกหรือช้ำ
+- ติดเชื้อ
+- แพ้ยา
+- เส้นประสาทระคายเคืองหรือบาดเจ็บ พบน้อย
+""",
+        "Others": """
+หัตถการบล็อกเส้นประสาทหรือฉีดยาชาเฉพาะที่อื่น ๆ ตามที่แพทย์อธิบาย
+
+ความเสี่ยงทั่วไปที่อาจเกิดขึ้น:
+- เจ็บบริเวณที่ฉีด
+- ชาหรืออ่อนแรงชั่วคราว
+- เลือดออกหรือช้ำ
+- ติดเชื้อ
+- แพ้ยา
+- เส้นประสาทระคายเคืองหรือบาดเจ็บ พบน้อย
+""",
+    }
+    return info.get(procedure, info["Others"])
+
+
+def create_pdf(record: dict):
     tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     filename = tmp_pdf.name
     tmp_pdf.close()
@@ -269,6 +334,12 @@ def create_pdf(record):
             story.append(Paragraph(f"{labels.get(key, key)}: {record.get(key)}", normal))
             story.append(Spacer(1, 6))
 
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("ข้อมูลที่ได้รับการอธิบาย", normal))
+    for line in procedure_information(record.get("procedure", "Others")).strip().split("\n"):
+        if line.strip():
+            story.append(Paragraph(line.strip(), normal))
+
     sig_labels = {
         "patient_signature": "ลายเซ็นผู้ป่วย",
         "doctor_signature": "ลายเซ็นแพทย์",
@@ -281,7 +352,7 @@ def create_pdf(record):
             imgfile = decode_sig_to_tempfile(sig64)
             story.append(Spacer(1, 8))
             story.append(Paragraph(sig_label, normal))
-            story.append(RLImage(imgfile, width=7 * cm, height=2.8 * cm))
+            story.append(RLImage(imgfile, width=7 * cm, height=3.5 * cm))
 
     doc.build(story)
     return filename
@@ -306,45 +377,42 @@ if menu == "Patient Consent Form":
     with c2:
         doctor_name = st.text_input("แพทย์")
         nurse_name = st.text_input("พยาบาลพยาน")
-        procedure = st.selectbox("หัตถการ", ["Ankle Block", "Brachial Block"])
+        block_options = [
+            "Ankle Block",
+            "Brachial Block",
+            "Popliteal Block",
+            "Cervical Block",
+            "Sciatic Block",
+            "Others",
+        ]
+        procedure_choice = st.selectbox("หัตถการ / Block", block_options)
+        other_procedure = ""
+        if procedure_choice == "Others":
+            other_procedure = st.text_input("ระบุหัตถการอื่น ๆ", placeholder="เช่น Digital block, Local infiltration, Field block")
+
+    procedure = other_procedure.strip() if procedure_choice == "Others" and other_procedure.strip() else procedure_choice
 
     st.markdown("---")
+    st.info(procedure_information(procedure_choice))
 
-    if procedure == "Ankle Block":
-        st.info(
-            """
-การฉีดยาชาบริเวณข้อเท้าเพื่อทำแผล
-
-ความเสี่ยง:
-- เจ็บ
-- ชา
-- เลือดออก
-- ติดเชื้อ
-- แพ้ยา
-"""
-        )
-    else:
-        st.info(
-            """
-การฉีดยาชาบริเวณแขนเพื่อทำแผลมือ
-
-ความเสี่ยง:
-- เจ็บ
-- ชา/อ่อนแรงชั่วคราว
-- เลือดออก
-- แพ้ยา
-- เส้นประสาทบาดเจ็บ พบน้อย
-"""
-        )
-
-    agree = st.checkbox("ข้าพเจ้ายินยอม")
+    agree = st.checkbox("ข้าพเจ้าได้รับคำอธิบาย เข้าใจประโยชน์ ความเสี่ยง ทางเลือก และยินยอมให้ทำหัตถการ")
 
     st.markdown("---")
-    st.info("วิธีใช้: ให้ผู้ป่วย/แพทย์/พยาบาลเซ็นบนกระดาษหรือมือถือ แล้วถ่ายภาพ/บันทึกภาพเป็น PNG/JPG เพื่ออัปโหลด ระบบนี้เสถียรกว่า canvas บน Streamlit Cloud")
-    patient_sig = signature_upload("ผู้ป่วยเซ็นชื่อ", "patient_signature_upload", required=True)
-    doctor_sig = signature_upload("แพทย์เซ็นชื่อ", "doctor_signature_upload")
-    nurse_sig = signature_upload("พยาบาลพยานเซ็นชื่อ", "nurse_signature_upload")
+    st.subheader("ถ่ายภาพลายเซ็นจากกระดาษ")
+    st.info(
+        "วิธีใช้บนมือถือ: ให้ผู้ป่วย แพทย์ และพยาบาลเซ็นบนกระดาษ แล้วกดปุ่มกล้องแต่ละช่องเพื่อถ่ายภาพลายเซ็น "
+        "ระบบจะบันทึกภาพลง PostgreSQL และใส่ใน PDF อัตโนมัติ"
+    )
 
+    sig_col1, sig_col2, sig_col3 = st.columns(3)
+    with sig_col1:
+        patient_sig = camera_signature("ผู้ป่วยเซ็นชื่อ", "patient_signature_camera", required=True)
+    with sig_col2:
+        doctor_sig = camera_signature("แพทย์เซ็นชื่อ", "doctor_signature_camera")
+    with sig_col3:
+        nurse_sig = camera_signature("พยาบาลพยานเซ็นชื่อ", "nurse_signature_camera")
+
+    st.markdown("---")
     if st.button("💾 Save", type="primary"):
         if not patient_id.strip() or not patient_name.strip():
             st.warning("กรุณากรอก HN / เลขบัตร และชื่อผู้ป่วย")
@@ -352,8 +420,11 @@ if menu == "Patient Consent Form":
         if not agree:
             st.warning("กรุณาติ๊กยินยอมก่อนบันทึก")
             st.stop()
+        if procedure_choice == "Others" and not other_procedure.strip():
+            st.warning("กรุณาระบุหัตถการอื่น ๆ")
+            st.stop()
         if not patient_sig:
-            st.warning("กรุณาให้ผู้ป่วยเซ็นชื่อ")
+            st.warning("กรุณาถ่ายภาพลายเซ็นผู้ป่วย")
             st.stop()
 
         rec = {
@@ -414,4 +485,5 @@ if menu == "Admin Dashboard":
         st.bar_chart(df["procedure"].value_counts())
     else:
         st.info("No data")
+
 
