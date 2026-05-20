@@ -4,4 +4,4 @@ psycopg2-binary
 reportlab
 pytz
 pillow
-streamlit-drawable-canvas
+
