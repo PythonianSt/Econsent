@@ -56,10 +56,13 @@ def get_database_url() -> str:
         st.stop()
     return db_url
 
-
+@st.cache_resource
 def get_conn():
-    """Create a PostgreSQL connection. The connection is short-lived and closed after use."""
-    return psycopg2.connect(get_database_url())
+    return psycopg2.connect(
+        st.secrets["DATABASE_URL"]
+    )
+
+conn = get_conn()
 
 
 def init_db():
