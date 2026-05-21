@@ -21,6 +21,7 @@
 # THAI_FONT_PATH = "fonts/NotoSansThai-Regular.ttf"
 
 import base64
+import html
 import io
 import os
 import tempfile
@@ -132,30 +133,61 @@ except Exception as e:
     st.stop()
 
 # ---------------- PDF FONT ----------------
-def setup_pdf_font() -> str:
-    """Register a Thai-capable font if available; otherwise fallback to Helvetica."""
+def setup_pdf_font():
+    """
+    Register TH Sarabun New for clean Thai PDF output.
+
+    Priority:
+    1) Font uploaded in the Streamlit sidebar during the current session
+    2) THAI_FONT_PATH in Streamlit secrets / environment
+    3) THSarabunNew.ttf in app root
+    4) fonts/THSarabunNew.ttf
+
+    Returns:
+        tuple[str | None, str | None]: (reportlab_font_name, actual_font_path)
+    """
+    st.sidebar.markdown("### PDF Thai font")
+    uploaded_font = st.sidebar.file_uploader(
+        "Upload THSarabunNew.ttf if Thai PDF looks wrong",
+        type=["ttf"],
+        key="thai_font_upload",
+    )
+
     candidates = []
-    secret_font = st.secrets.get("THAI_FONT_PATH", None)
+
+    if uploaded_font is not None:
+        tmp_font_path = Path(tempfile.gettempdir()) / "THSarabunNew_uploaded.ttf"
+        tmp_font_path.write_bytes(uploaded_font.getvalue())
+        candidates.append(str(tmp_font_path))
+
+    secret_font = st.secrets.get("THAI_FONT_PATH", None) or os.getenv("THAI_FONT_PATH")
     if secret_font:
         candidates.append(secret_font)
 
     candidates.extend([
-        "fonts/NotoSansThai-Regular.ttf",
-        "NotoSansThai-Regular.ttf",
         "THSarabunNew.ttf",
+        "./THSarabunNew.ttf",
         "fonts/THSarabunNew.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "./fonts/THSarabunNew.ttf",
     ])
 
-    for path in candidates:
-        if path and Path(path).exists():
-            pdfmetrics.registerFont(TTFont("ThaiFont", path))
-            return "ThaiFont"
-    return "Helvetica"
+    for font_path in candidates:
+        if font_path and Path(font_path).exists():
+            try:
+                pdfmetrics.registerFont(TTFont("THSarabunNew", font_path))
+                st.sidebar.success(f"Using Thai PDF font: {Path(font_path).name}")
+                return "THSarabunNew", str(font_path)
+            except Exception as e:
+                st.sidebar.warning(f"Font found but could not be loaded: {font_path} ({e})")
+
+    st.sidebar.error(
+        "THSarabunNew.ttf was not found. PDF generation is disabled until the font is uploaded "
+        "or placed in the app root / fonts folder."
+    )
+    return None, None
 
 
-PDF_FONT = setup_pdf_font()
+PDF_FONT, PDF_FONT_PATH = setup_pdf_font()
 
 # ---------------- HELPERS ----------------
 def now_bkk():
@@ -282,6 +314,17 @@ def procedure_information(procedure: str) -> str:
     return info.get(procedure, info["Others"])
 
 
+def pdf_safe_text(value) -> str:
+    """Escape text for ReportLab Paragraph while preserving Thai text and line breaks."""
+    if value is None:
+        return ""
+    return html.escape(str(value)).replace("\n", "<br/>")
+
+
+def thai_paragraph(value, style):
+    return Paragraph(pdf_safe_text(value), style)
+
+
 def create_pdf(record: dict):
     tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     filename = tmp_pdf.name
@@ -297,22 +340,31 @@ def create_pdf(record: dict):
     )
 
     styles = getSampleStyleSheet()
+    if not PDF_FONT:
+        raise RuntimeError(
+            "THSarabunNew.ttf not loaded. Please upload THSarabunNew.ttf in the sidebar "
+            "or place it in the app root / fonts folder."
+        )
+
     normal = ParagraphStyle(
         "ThaiNormal",
         parent=styles["Normal"],
         fontName=PDF_FONT,
-        fontSize=12,
-        leading=18,
+        fontSize=16,
+        leading=22,
+        wordWrap="CJK",
+        splitLongWords=False,
     )
     title = ParagraphStyle(
         "ThaiTitle",
         parent=styles["Title"],
         fontName=PDF_FONT,
-        fontSize=18,
-        leading=24,
+        fontSize=24,
+        leading=30,
+        wordWrap="CJK",
     )
 
-    story = [Paragraph("ใบยินยอมทำหัตถการ", title), Spacer(1, 12)]
+    story = [thai_paragraph("ใบยินยอมทำหัตถการ", title), Spacer(1, 12)]
 
     labels = {
         "record_id": "เลขที่บันทึก",
@@ -331,14 +383,14 @@ def create_pdf(record: dict):
         "nurse_name", "procedure", "agree", "timestamp_bkk"
     ]:
         if key in record:
-            story.append(Paragraph(f"{labels.get(key, key)}: {record.get(key)}", normal))
+            story.append(thai_paragraph(f"{labels.get(key, key)}: {record.get(key)}", normal))
             story.append(Spacer(1, 6))
 
     story.append(Spacer(1, 8))
-    story.append(Paragraph("ข้อมูลที่ได้รับการอธิบาย", normal))
+    story.append(thai_paragraph("ข้อมูลที่ได้รับการอธิบาย", normal))
     for line in procedure_information(record.get("procedure", "Others")).strip().split("\n"):
         if line.strip():
-            story.append(Paragraph(line.strip(), normal))
+            story.append(thai_paragraph(line.strip(), normal))
 
     sig_labels = {
         "patient_signature": "ลายเซ็นผู้ป่วย",
@@ -351,7 +403,7 @@ def create_pdf(record: dict):
         if sig64:
             imgfile = decode_sig_to_tempfile(sig64)
             story.append(Spacer(1, 8))
-            story.append(Paragraph(sig_label, normal))
+            story.append(thai_paragraph(sig_label, normal))
             story.append(RLImage(imgfile, width=7 * cm, height=3.5 * cm))
 
     doc.build(story)
@@ -485,5 +537,6 @@ if menu == "Admin Dashboard":
         st.bar_chart(df["procedure"].value_counts())
     else:
         st.info("No data")
+
 
 
